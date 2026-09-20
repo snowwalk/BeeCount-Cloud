@@ -941,6 +941,11 @@ async def _commit_write(
         # 从 projection 按需构建当前状态给 mutator 吃。这个 snapshot dict 不写回 DB ——
         # 只是 mutator 内部用来查当前实体、做 duplicate/actor 校验。
         snapshot = snapshot_builder.build(db, ledger)
+        # 先归一再拷 prev:mutator 内部 ensure_snapshot_v2 会归一 happenedAt 等
+        # 字段(如 +08:00 → +00:00),build() 则原样输出投影里的值。两边形状
+        # 不一致会让 diff 把全账本交易误判为 changed —— 删一个分类 emit 800+
+        # 条 SyncChange,请求 5s。归一后 prev/next 同形状,只剩真变更。
+        snapshot = ensure_snapshot_v2(snapshot)
         # Shallow-per-entity copy for diffing(mutator 会原地改 items[i] 等)
         prev_snapshot = {**snapshot}
         for _k in ("items", "accounts", "categories", "tags", "budgets"):
