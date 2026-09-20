@@ -6,6 +6,7 @@ import {
   fetchWorkspaceCategories,
   fetchWorkspaceTags,
   fetchWorkspaceTransactions,
+  migrateCategory,
   updateCategory,
   uploadAttachment,
   type ReadCategory,
@@ -22,6 +23,7 @@ import {
 } from '@beecount/web-features'
 
 import { useLedgerWrite } from '../../app/useLedgerWrite'
+import { CategoryMigrateDialog } from '../../components/categories/CategoryMigrateDialog'
 import { dispatchOpenDetailCategory } from '../../lib/txDialogEvents'
 import { useAttachmentCache } from '../../context/AttachmentCacheContext'
 import { useAuth } from '../../context/AuthContext'
@@ -42,13 +44,16 @@ export function CategoriesPage() {
   const t = useT()
   const toast = useToast()
   const { token } = useAuth()
-  const { activeLedgerId } = useLedgers()
+  const { ledgers, activeLedgerId } = useLedgers()
   const { retryOnConflict, isWriteConflict } = useLedgerWrite()
   const { previewMap: iconPreviewByFileId, ensureLoadedMany } = useAttachmentCache()
 
   const [rows, setRows] = usePageCache<WorkspaceCategory[]>('categories:rows', [])
   const [form, setForm] = useState<CategoryForm>(categoryDefaults())
   const [pendingDelete, setPendingDelete] = useState<{ id: string; name: string } | null>(null)
+  // 迁移 dialog 的源分类(workspace 行,带 tx_count / kind / parent_name)
+  const [pendingMigrate, setPendingMigrate] = useState<WorkspaceCategory | null>(null)
+  const [migrateSaving, setMigrateSaving] = useState(false)
   // 编辑 dialog 受控开关 — CategoriesPanel 行编辑、CategoryDetailDialog 联动
   // 编辑都通过这个 state 触发;由 panel 内部 onCreate/onEdit 也会切到 true。
   const [editDialogOpen, setEditDialogOpen] = useState(false)
@@ -172,6 +177,128 @@ export function CategoriesPage() {
     }
   }
 
+  // 源分类的子分类数(跟删除拦截同口径)—— 有子分类时禁止"迁完删除源分类"。
+  const childCountOf = useCallback(
+    (row: WorkspaceCategory) =>
+      rows.filter(
+        (r) =>
+          r.id !== row.id &&
+          r.parent_name === row.name &&
+          r.kind === row.kind
+      ).length,
+    [rows]
+  )
+
+  /** 分类迁移编排:发现受影响交易 → 逐账本调迁移端点 → 可选删除源分类。 */
+  const handleMigrateConfirm = async (
+    target: WorkspaceCategory,
+    deleteSource: boolean
+  ) => {
+    if (!pendingMigrate) return
+    const source = pendingMigrate
+    setMigrateSaving(true)
+    try {
+      // 1) 发现受影响交易:q=源分类名走服务端模糊过滤(超集),客户端再按
+      //    categoryId 或 (name, kind) 精确过滤 —— 跟后端迁移端点匹配口径一致,
+      //    兼容旧 app 只有分类名、没有 categoryId 的存量交易。
+      const matched: WorkspaceTransaction[] = []
+      const limit = 1000
+      let offset = 0
+      for (;;) {
+        const page = await fetchWorkspaceTransactions(token, {
+          q: source.name,
+          limit,
+          offset,
+        })
+        for (const item of page.items) {
+          const byId = item.category_id === source.id
+          const byName =
+            item.category_name === source.name && item.category_kind === source.kind
+          if (byId || byName) matched.push(item)
+        }
+        offset += limit
+        if (offset >= page.total || page.items.length === 0) break
+      }
+
+      // 2) 按账本分组;只读账本(viewer)里的交易迁不了,单独计数提示
+      const writableLedgerIds = new Set(
+        ledgers.filter((l) => l.role !== 'viewer').map((l) => l.ledger_id)
+      )
+      const ledgerIds = new Set<string>()
+      let readonlyCount = 0
+      for (const item of matched) {
+        if (writableLedgerIds.has(item.ledger_id)) {
+          ledgerIds.add(item.ledger_id)
+        } else {
+          readonlyCount += 1
+        }
+      }
+
+      // 3) 逐账本迁移(端点内部按 name+kind 兜底再匹配一遍,发现的遗漏由它兜住)
+      let moved = 0
+      let failed = 0
+      let firstError: string | null = null
+      for (const ledgerId of ledgerIds) {
+        try {
+          const res = await migrateCategory(token, {
+            ledgerId,
+            sourceCategoryId: source.id,
+            targetCategoryId: target.id,
+          })
+          moved += res.moved_count
+          failed += res.failed.length
+        } catch (err) {
+          firstError = firstError ?? localizeError(err, t)
+        }
+      }
+
+      // 4) 可选:全部迁完且零失败 → 走既有 DELETE 端点删源分类
+      let deleted = false
+      if (
+        deleteSource &&
+        failed === 0 &&
+        !firstError &&
+        readonlyCount === 0 &&
+        activeLedgerId
+      ) {
+        try {
+          await retryOnConflict(activeLedgerId, (base) =>
+            deleteCategory(token, activeLedgerId, source.id, base)
+          )
+          deleted = true
+        } catch (err) {
+          // 迁移已成功,删除失败单独提示,不影响迁移结果
+          notifyError(err)
+        }
+      }
+
+      // 5) 汇总提示 + 刷新
+      if (firstError) {
+        toast.error(t('categories.migrateResult.error', { message: firstError }))
+      } else if (failed > 0) {
+        toast.error(t('categories.migrateResult.partial', { moved, failed }))
+      } else if (moved > 0) {
+        toast.success(t('categories.migrateResult.ok', { count: moved }))
+      } else {
+        toast.success(t('categories.migrateResult.ok', { count: 0 }))
+      }
+      if (readonlyCount > 0) {
+        toast.error(
+          t('categories.migrateResult.readonlyLedgers', { count: readonlyCount })
+        )
+      }
+      if (deleted) {
+        toast.success(t('categories.migrateResult.deleted'))
+      }
+      setPendingMigrate(null)
+      await refresh()
+    } catch (err) {
+      notifyError(err)
+    } finally {
+      setMigrateSaving(false)
+    }
+  }
+
   return (
     <>
       <CategoriesPanel
@@ -187,6 +314,12 @@ export function CategoriesPage() {
         onSave={onSave}
         onReset={() => setForm(categoryDefaults())}
         onEdit={enterEdit}
+        onMigrate={(row) => {
+          const ws =
+            (rows.find((r) => r.id === row.id) as WorkspaceCategory | undefined) ||
+            (row as WorkspaceCategory)
+          setPendingMigrate(ws)
+        }}
         onRowClick={(row) => dispatchOpenDetailCategory(row, { defaultScope: 'all' })}
         onDelete={(row) => {
           // 跟 mobile + AccountsPage 对齐:有关联交易 / 子分类 → 拒删,要求
@@ -250,6 +383,18 @@ export function CategoriesPage() {
         onCancel={() => setPendingDelete(null)}
         onConfirm={() => void confirmDelete()}
       />
+      {pendingMigrate ? (
+        <CategoryMigrateDialog
+          open={!!pendingMigrate}
+          source={pendingMigrate}
+          sourceChildCount={childCountOf(pendingMigrate)}
+          rows={rows}
+          iconPreviewUrlByFileId={iconPreviewByFileId}
+          saving={migrateSaving}
+          onConfirm={(target, deleteSource) => void handleMigrateConfirm(target, deleteSource)}
+          onClose={() => setPendingMigrate(null)}
+        />
+      ) : null}
       {/* CategoryDetailDialog 已迁到 GlobalEntityDialogs。本页 onClickCategory 现
           dispatch openDetailCategory 让全局弹窗渲染。 */}
     </>
