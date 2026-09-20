@@ -1,14 +1,15 @@
-"""POST /api/v1/write/ledgers/{ledger_id}/transactions/batch/delete — 批量删除交易。
+"""POST /api/v1/write/ledgers/{ledger_id}/transactions/batch/update — 批量修改交易分类。
 
-设计:.docs/web-tx-batch-actions.md §4.2
+跟 transactions_batch_delete.py 同模式:单 snapshot lock + 循环 mutator +
+一次 SyncChange broadcast + 一次 idempotency。区别:
 
-跟 transactions_batch.py(create)同模式:单 snapshot lock + 一次 SyncChange
-broadcast + 一次 idempotency。区别:
-
-- 跑 `delete_transaction` mutator(逐个 sync_id)
+- 跑 `update_transaction` mutator,只传 category 三字段(presence 语义,
+  不碰其它字段)
+- `category_kind` 只允许 expense/income(transfer 交易没有分类);tx.type
+  与 category_kind 不一致的条目记 `failed(kind_mismatch)` 跳过,防止误改
+  transfer/跨类型交易 — 前端会预过滤,这里是服务端兜底
 - 部分失败按 tx 粒度返回 `failed[]`,只在事务级错误才 500
-- 不开放 base_change_id 严格校验(用户多选时不应该被并发其它写入卡死;现有
-  单笔 DELETE 也用 lenient 模式)
+- 不开放 base_change_id 严格校验(跟批量删除同口径)
 """
 from __future__ import annotations
 
@@ -16,8 +17,9 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, Request, status
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -25,10 +27,8 @@ from ... import snapshot_builder
 from ...concurrency import lock_ledger_for_materialize
 from ...database import get_db
 from ...deps import get_current_user
-from sqlalchemy import select
-
 from ...models import AuditLog, SyncPushIdempotency, User
-from ...snapshot_mutator import delete_transaction, ensure_snapshot_v2
+from ...snapshot_mutator import ensure_snapshot_v2, update_transaction
 from ._shared import (
     _TRANSACTION_WRITE_ROLES,
     _WRITE_RESPONSES,
@@ -44,41 +44,44 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-class BatchTxDeleteRequest(BaseModel):
+class BatchTxUpdateRequest(BaseModel):
     tx_ids: list[str] = Field(..., min_length=1, max_length=200)
+    category_id: str
+    category_name: str = Field(..., min_length=1)
+    category_kind: Literal["expense", "income"]
     base_change_id: int = 0
 
 
-class BatchTxFailure(BaseModel):
+class BatchTxUpdateFailure(BaseModel):
     tx_id: str
-    reason: Literal["not_found", "permission_denied", "conflict"]
+    reason: Literal["not_found", "permission_denied", "conflict", "kind_mismatch"]
     message: str | None = None
 
 
-class BatchTxDeleteResponse(BaseModel):
+class BatchTxUpdateResponse(BaseModel):
     ledger_id: str
     base_change_id: int
     new_change_id: int
     server_timestamp: datetime
-    deleted_tx_ids: list[str] = Field(default_factory=list)
-    failed: list[BatchTxFailure] = Field(default_factory=list)
+    updated_tx_ids: list[str] = Field(default_factory=list)
+    failed: list[BatchTxUpdateFailure] = Field(default_factory=list)
 
 
 @router.post(
-    "/ledgers/{ledger_id}/transactions/batch/delete",
-    response_model=BatchTxDeleteResponse,
+    "/ledgers/{ledger_id}/transactions/batch/update",
+    response_model=BatchTxUpdateResponse,
     responses=_WRITE_RESPONSES,
 )
-async def delete_tx_batch(
+async def update_tx_batch_category(
     ledger_id: str,
-    req: BatchTxDeleteRequest,
+    req: BatchTxUpdateRequest,
     request: Request,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     device_id: str = Header(default="web-console", alias="X-Device-ID"),
     _scopes: set[str] = Depends(_WRITE_SCOPE_DEP),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> BatchTxDeleteResponse:
+) -> BatchTxUpdateResponse:
     payload_for_ide = req.model_dump(mode="json")
     ledger, replay = _prepare_write(
         db=db,
@@ -92,8 +95,7 @@ async def delete_tx_batch(
         payload=payload_for_ide,
     )
     if replay:
-        # _prepare_write 返回的 replay 是通用 WriteCommitMeta(字段集少),
-        # 我们的批量响应字段更多 —— 直接从 DB 拿原始 response_json 重建。
+        # 同 batch/delete:从 DB 拿原始 response_json 重建完整响应。
         row = db.scalar(
             select(SyncPushIdempotency).where(
                 SyncPushIdempotency.user_id == current_user.id,
@@ -102,18 +104,17 @@ async def delete_tx_batch(
             )
         )
         if row is not None and row.response_json:
-            return BatchTxDeleteResponse.model_validate(row.response_json)
-        # 兜底:落到通用 meta 的字段子集(理论上不该走到这里)
-        return BatchTxDeleteResponse(
+            return BatchTxUpdateResponse.model_validate(row.response_json)
+        return BatchTxUpdateResponse(
             ledger_id=ledger.external_id,
             base_change_id=req.base_change_id,
             new_change_id=replay.new_change_id,
             server_timestamp=replay.server_timestamp,
-            deleted_tx_ids=[],
+            updated_tx_ids=[],
             failed=[],
         )
 
-    # 去重 —— 同一 sync_id 只删一次
+    # 去重 —— 同一 sync_id 只改一次
     unique_ids: list[str] = []
     seen: set[str] = set()
     for tx_id in req.tx_ids:
@@ -123,42 +124,59 @@ async def delete_tx_batch(
 
     lock_ledger_for_materialize(db, ledger.id)
     snapshot = snapshot_builder.build(db, ledger)
-    # 归一成 UTC 再拷 prev,避免 happenedAt 时区格式差异导致全账本误 emit
-    # (同 _commit_write)。补上此前缺失的一行。
+    # 归一成 UTC 再拷 prev,避免 happenedAt 时区格式差异导致 _emit_entity_diffs
+    # 把未变更的交易误判为 changed(全账本误 emit)。同 _commit_write。
     snapshot = ensure_snapshot_v2(snapshot)
-    # 深拷贝快照用于 diff(跟 batch_create 同模式)
+    # 深拷贝快照用于 diff(跟 batch/delete 同模式)
     prev_snapshot = {**snapshot}
     for _k in ("items", "accounts", "categories", "tags", "budgets"):
         arr = snapshot.get(_k)
         if isinstance(arr, list):
             prev_snapshot[_k] = [dict(e) if isinstance(e, dict) else e for e in arr]
 
-    # 循环 mutate;单个 tx 报错 → 记 failed 继续。事务级错误(KeyboardInterrupt 等)
-    # 不在这里捕获,按惯例往上抛由 FastAPI 处理。
-    deleted_ids: list[str] = []
-    failed: list[BatchTxFailure] = []
-    delete_payload = _payload_with_actor({}, current_user)
+    category_payload = _payload_with_actor(
+        {
+            "category_id": req.category_id,
+            "category_name": req.category_name,
+            "category_kind": req.category_kind,
+        },
+        current_user,
+    )
+
+    updated_ids: list[str] = []
+    failed: list[BatchTxUpdateFailure] = []
+    tx_by_id = _tx_index(snapshot)
 
     for tx_id in unique_ids:
         try:
-            snapshot = delete_transaction(snapshot, tx_id, delete_payload)
-            deleted_ids.append(tx_id)
+            item = tx_by_id.get(tx_id)
+            if item is None:
+                raise KeyError(tx_id)
+            if str(item.get("type") or "") != req.category_kind:
+                failed.append(
+                    BatchTxUpdateFailure(
+                        tx_id=tx_id,
+                        reason="kind_mismatch",
+                        message=f"tx type {item.get('type') or 'unknown'} != category kind {req.category_kind}",
+                    )
+                )
+                continue
+            snapshot = update_transaction(snapshot, tx_id, category_payload)
+            updated_ids.append(tx_id)
         except KeyError:
-            # _find_by_sync_id 抛 KeyError → tx 不在 snapshot(已删 / ID 错 / 跨 ledger)
             failed.append(
-                BatchTxFailure(tx_id=tx_id, reason="not_found", message="transaction not in ledger")
+                BatchTxUpdateFailure(tx_id=tx_id, reason="not_found", message="transaction not in ledger")
             )
         except PermissionError as exc:
             failed.append(
-                BatchTxFailure(tx_id=tx_id, reason="permission_denied", message=str(exc))
+                BatchTxUpdateFailure(tx_id=tx_id, reason="permission_denied", message=str(exc))
             )
         except ValueError as exc:
-            # snapshot_mutator 在 sync_id prefix 不对 / 其它校验失败时抛
-            failed.append(BatchTxFailure(tx_id=tx_id, reason="conflict", message=str(exc)))
+            failed.append(BatchTxUpdateFailure(tx_id=tx_id, reason="conflict", message=str(exc)))
 
     # diff + emit changes(只针对实际变更的 items)
     now = datetime.now(timezone.utc)
-    if deleted_ids:
+    if updated_ids:
         emitted_change_ids = _emit_entity_diffs(
             db,
             ledger=ledger,
@@ -178,25 +196,28 @@ async def delete_tx_batch(
         AuditLog(
             user_id=current_user.id,
             ledger_id=ledger.id,
-            action="web_tx_batch_delete",
+            action="web_tx_batch_update",
             metadata_json={
                 "ledgerId": ledger.external_id,
                 "baseChangeId": req.base_change_id,
                 "newChangeId": new_change_id,
-                "deletedCount": len(deleted_ids),
-                "deletedIds": deleted_ids,
+                "categoryId": req.category_id,
+                "categoryName": req.category_name,
+                "categoryKind": req.category_kind,
+                "updatedCount": len(updated_ids),
+                "updatedIds": updated_ids,
                 "failedCount": len(failed),
                 "failedIds": [f.tx_id for f in failed],
             },
         )
     )
 
-    response = BatchTxDeleteResponse(
+    response = BatchTxUpdateResponse(
         ledger_id=ledger.external_id,
         base_change_id=req.base_change_id,
         new_change_id=new_change_id,
         server_timestamp=now,
-        deleted_tx_ids=deleted_ids,
+        updated_tx_ids=updated_ids,
         failed=failed,
     )
 
@@ -227,15 +248,15 @@ async def delete_tx_batch(
                 request_hash=request_hash,
             )
             if replay is not None:
-                return BatchTxDeleteResponse(**replay.model_dump()) if hasattr(replay, "model_dump") else replay  # type: ignore[return-value]
+                return BatchTxUpdateResponse(**replay.model_dump()) if hasattr(replay, "model_dump") else replay  # type: ignore[return-value]
         raise
 
     logger.info(
-        "tx.batch_delete ledger=%s deleted=%d failed=%d change_id=%d device=%s user=%s",
-        ledger.external_id, len(deleted_ids), len(failed), new_change_id, device_id, current_user.id,
+        "tx.batch_update ledger=%s updated=%d failed=%d change_id=%d device=%s user=%s",
+        ledger.external_id, len(updated_ids), len(failed), new_change_id, device_id, current_user.id,
     )
 
-    if deleted_ids:
+    if updated_ids:
         # 共享账本:fan-out 给所有 LedgerMember,Editor 端 mobile 实时收到。
         from ...websocket_manager import broadcast_to_ledger
         await broadcast_to_ledger(
@@ -250,3 +271,12 @@ async def delete_tx_batch(
             },
         )
     return response
+
+
+def _tx_index(snapshot: dict) -> dict[str, dict]:
+    """syncId → item 索引;找不到的 id 在调用侧通过 .get() 判 None。"""
+    out: dict[str, dict] = {}
+    for item in snapshot.get("items") or []:
+        if isinstance(item, dict) and item.get("syncId"):
+            out[str(item["syncId"])] = item
+    return out

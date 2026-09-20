@@ -1,5 +1,5 @@
 import { Button, useT } from '@beecount/ui'
-import { CheckSquare, Download, Trash2, X } from 'lucide-react'
+import { CheckSquare, Download, FolderInput, Trash2, X } from 'lucide-react'
 
 interface Props {
   selectedCount: number
@@ -8,6 +8,7 @@ interface Props {
   allVisibleSelected: boolean
   saving?: boolean
   onToggleAllVisible: () => void
+  onEditCategory: () => void
   onDelete: () => void
   onExport: () => void
   onExit: () => void
@@ -27,6 +28,7 @@ export function SelectionToolbar({
   allVisibleSelected,
   saving = false,
   onToggleAllVisible,
+  onEditCategory,
   onDelete,
   onExport,
   onExit,
@@ -63,6 +65,16 @@ export function SelectionToolbar({
         >
           <Download className="mr-1 h-3.5 w-3.5" />
           {t('txBatch.exportCsv')}
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-7"
+          onClick={onEditCategory}
+          disabled={noneSelected || saving}
+        >
+          <FolderInput className="mr-1 h-3.5 w-3.5" />
+          {t('txBatch.editCategory')}
         </Button>
         <Button
           size="sm"

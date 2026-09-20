@@ -39,6 +39,8 @@ type CardBodyProps = {
   rows: WorkspaceCategory[]
   onEdit: (row: ReadCategory) => void
   onDelete?: (row: ReadCategory) => void
+  /** 迁移入口:把该分类下的交易迁到另一个分类(仅 canManage 时展示)。 */
+  onMigrate?: (row: ReadCategory) => void
   /** 整行点击回调 — 不传则行不可点击;传了则点击行(避开 Edit / Delete 按钮)
    *  会派发该事件。外层用来弹分类详情。 */
   onRowClick?: (row: WorkspaceCategory) => void
@@ -89,9 +91,11 @@ function ManageCategoryCell({
   onActivate,
   onEdit,
   onDelete,
+  onMigrate,
   canManage,
   editLabel,
   deleteLabel,
+  migrateLabel,
 }: {
   category: WorkspaceCategory
   renderIcon: RenderIcon
@@ -104,9 +108,11 @@ function ManageCategoryCell({
   onActivate: () => void
   onEdit: () => void
   onDelete?: () => void
+  onMigrate?: () => void
   canManage: boolean
   editLabel: string
   deleteLabel: string
+  migrateLabel: string
 }) {
   const circleSize = compact ? 'h-12 w-12' : 'h-14 w-14'
   return (
@@ -148,6 +154,27 @@ function ManageCategoryCell({
             <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
           </svg>
         </button>
+        {onMigrate ? (
+          <button
+            type="button"
+            title={migrateLabel}
+            aria-label={migrateLabel}
+            disabled={!canManage}
+            onClick={(e) => {
+              e.stopPropagation()
+              onMigrate()
+            }}
+            className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-primary disabled:opacity-40"
+          >
+            {/* lucide folder-input:把交易迁入另一个分类 */}
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+              <path d="M2 9V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H20a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-1" />
+              <path d="M2 13h10" />
+              <path d="m9 16 3-3-3-3" />
+            </svg>
+          </button>
+        ) : null}
         {onDelete ? (
           <button
             type="button"
@@ -209,6 +236,7 @@ function CategoriesCardBody({
   rows,
   onEdit,
   onDelete,
+  onMigrate,
   onRowClick,
   canManage,
   txCountById = {},
@@ -288,6 +316,7 @@ function CategoriesCardBody({
   const countUnit = t('tags.count.unit')
   const editLabel = t('common.edit')
   const deleteLabel = t('common.delete')
+  const migrateLabel = t('categories.migrate.action')
 
   return (
     <div className="space-y-4">
@@ -363,9 +392,11 @@ function CategoriesCardBody({
                         }}
                         onEdit={() => onEdit(parent)}
                         onDelete={onDelete ? () => onDelete(parent) : undefined}
+                        onMigrate={onMigrate ? () => onMigrate(parent) : undefined}
                         canManage={canManage}
                         editLabel={editLabel}
                         deleteLabel={deleteLabel}
+                        migrateLabel={migrateLabel}
                       />
                     )
                   })}
@@ -386,9 +417,11 @@ function CategoriesCardBody({
                           onActivate={() => onRowClick?.(child)}
                           onEdit={() => onEdit(child)}
                           onDelete={onDelete ? () => onDelete(child) : undefined}
+                          onMigrate={onMigrate ? () => onMigrate(child) : undefined}
                           canManage={canManage}
                           editLabel={editLabel}
                           deleteLabel={deleteLabel}
+                          migrateLabel={migrateLabel}
                         />
                       ))}
                     </div>
@@ -575,6 +608,8 @@ type CategoriesPanelProps = {
   onReset: () => void
   onEdit: (row: ReadCategory) => void
   onDelete?: (row: ReadCategory) => void
+  /** 分类迁移入口:把该分类下的交易迁到另一个分类(对齐 app"先迁移再删"口径)。 */
+  onMigrate?: (row: ReadCategory) => void
   /** 点击列表行(整行点击,避开 Edit / Delete 按钮)的回调。不传则行不可点击。 */
   onRowClick?: (row: WorkspaceCategory) => void
   /** Upload a custom icon file to the cloud and return the refs to store in the form. */
@@ -614,6 +649,7 @@ export function CategoriesPanel({
   onReset,
   onEdit,
   onDelete,
+  onMigrate,
   onRowClick,
   onUploadIcon,
   dialogOpen,
@@ -775,6 +811,7 @@ export function CategoriesPanel({
               rows={rows}
               onEdit={startEdit}
               onDelete={onDelete}
+              onMigrate={onMigrate}
               onRowClick={onRowClick}
               canManage={canManage}
               showCreatorColumn={showCreatorColumn}

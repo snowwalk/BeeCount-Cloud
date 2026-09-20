@@ -50,6 +50,7 @@ import {
   ApiError,
   batchAttachmentExists,
   batchDeleteTransactions,
+  batchUpdateTransactionsCategory,
   downloadAttachment,
   uploadAttachment,
   type AttachmentRef,
@@ -95,6 +96,7 @@ import {
 
 import { useAttachmentCache } from '../../context/AttachmentCacheContext'
 import { BatchDeleteDialog } from '../../components/tx-batch/BatchDeleteDialog'
+import { BatchEditCategoryDialog } from '../../components/tx-batch/BatchEditCategoryDialog'
 import { SelectionToolbar } from '../../components/tx-batch/SelectionToolbar'
 import { localizeError } from '../../i18n/errors'
 import { consumePendingShareText } from '../../lib/pwa-intake'
@@ -394,6 +396,7 @@ export function TransactionsPage() {
   const [selectedTxIds, setSelectedTxIds] = useState<Set<string>>(new Set())
   const lastClickIndexRef = useRef<number | null>(null)
   const [batchDeleteOpen, setBatchDeleteOpen] = useState(false)
+  const [batchEditCategoryOpen, setBatchEditCategoryOpen] = useState(false)
   const [batchSaving, setBatchSaving] = useState(false)
 
   const [adminUserStatusFilter, setAdminUserStatusFilter] = useState<'enabled' | 'disabled' | 'all'>('enabled')
@@ -1771,6 +1774,55 @@ export function TransactionsPage() {
       setBatchSaving(false)
     }
   }, [activeLedgerId, selectedTxIds, token, t, toast, exitSelection])
+
+  // 已选交易按 kind 分桶计数 —— 批量改分类 dialog 的 tab 与计数文案。
+  // transfer 永远进不了 bucket(无分类),由 kind_mismatch 兜底跳过。
+  const selectedKindCounts = useMemo(
+    () => ({
+      expense: selectedTxList.filter((tx) => tx.tx_type === 'expense').length,
+      income: selectedTxList.filter((tx) => tx.tx_type === 'income').length,
+    }),
+    [selectedTxList],
+  )
+
+  const handleBatchEditCategoryConfirm = useCallback(
+    async (kind: 'expense' | 'income', category: WorkspaceCategory) => {
+      if (!activeLedgerId) return
+      // 只发与目标分类同 kind 的已选交易(transfer 等在 dialog 计数里已排除)
+      const txIds = selectedTxList.filter((tx) => tx.tx_type === kind).map((tx) => tx.id)
+      if (txIds.length === 0) return
+      setBatchSaving(true)
+      try {
+        const result = await batchUpdateTransactionsCategory(token, {
+          ledgerId: activeLedgerId,
+          txIds,
+          categoryId: category.id,
+          categoryName: category.name,
+          categoryKind: kind,
+        })
+        const updated = result.updated_tx_ids.length
+        const failed = result.failed.length
+        if (failed > 0) {
+          toast.error(
+            t('txBatch.editCategoryResult.partial', {
+              updated,
+              failed,
+            }) as string,
+          )
+        } else {
+          toast.success(t('txBatch.editCategoryResult.ok', { count: updated }))
+        }
+        setBatchEditCategoryOpen(false)
+        exitSelection()
+        void onRefresh()
+      } catch (err) {
+        toast.error(localizeError(err, t))
+      } finally {
+        setBatchSaving(false)
+      }
+    },
+    [activeLedgerId, selectedTxList, token, t, toast, exitSelection],
+  )
   // ──────────────────────────────────────────
 
   return (
@@ -1913,6 +1965,7 @@ export function TransactionsPage() {
                   allVisibleSelected={allVisibleSelected}
                   saving={batchSaving}
                   onToggleAllVisible={toggleSelectAllVisible}
+                  onEditCategory={() => setBatchEditCategoryOpen(true)}
                   onDelete={() => setBatchDeleteOpen(true)}
                   onExport={handleBatchExport}
                   onExit={exitSelection}
@@ -2020,6 +2073,15 @@ export function TransactionsPage() {
                 saving={batchSaving}
                 onConfirm={handleBatchDeleteConfirm}
                 onClose={() => setBatchDeleteOpen(false)}
+              />
+              <BatchEditCategoryDialog
+                open={batchEditCategoryOpen}
+                counts={selectedKindCounts}
+                rows={txWriteCategories as unknown as WorkspaceCategory[]}
+                iconPreviewUrlByFileId={categoryIconPreviewByFileId}
+                saving={batchSaving}
+                onConfirm={handleBatchEditCategoryConfirm}
+                onClose={() => setBatchEditCategoryOpen(false)}
               />
             </div>
           ) : null}

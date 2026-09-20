@@ -17,12 +17,14 @@ from . import (
     accounts,
     budgets,
     categories,
+    categories_migrate,
     exchange_rate_overrides,
     ledgers,
     tags,
     transactions,
     transactions_batch,
     transactions_batch_delete,
+    transactions_batch_update,
 )
 
 router = APIRouter()
@@ -30,8 +32,10 @@ router.include_router(ledgers.router)
 router.include_router(transactions.router)
 router.include_router(transactions_batch.router)
 router.include_router(transactions_batch_delete.router)
+router.include_router(transactions_batch_update.router)
 router.include_router(accounts.router)
 router.include_router(budgets.router)
 router.include_router(categories.router)
+router.include_router(categories_migrate.router)
 router.include_router(tags.router)
 router.include_router(exchange_rate_overrides.router)

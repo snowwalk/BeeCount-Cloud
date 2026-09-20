@@ -120,6 +120,100 @@ export async function batchDeleteTransactions(
   )
 }
 
+export type BatchUpdateTxFailure = {
+  tx_id: string
+  reason: 'not_found' | 'permission_denied' | 'conflict' | 'kind_mismatch'
+  message?: string | null
+}
+
+export type BatchUpdateTxResponse = {
+  ledger_id: string
+  base_change_id: number
+  new_change_id: number
+  server_timestamp: string
+  updated_tx_ids: string[]
+  failed: BatchUpdateTxFailure[]
+}
+
+/**
+ * POST /write/ledgers/{id}/transactions/batch/update — 批量修改交易分类。
+ *
+ * 跟 batch/delete 同约束:单次最多 200 条;部分失败返回 failed[];
+ * tx.type 与 categoryKind 不一致的条目记 kind_mismatch 跳过(transfer
+ * 交易没有分类,前端应预过滤,这里是服务端兜底)。
+ */
+export async function batchUpdateTransactionsCategory(
+  token: string,
+  options: {
+    ledgerId: string
+    txIds: string[]
+    categoryId: string
+    categoryName: string
+    categoryKind: 'expense' | 'income'
+    baseChangeId?: number
+    idempotencyKey?: string
+  }
+): Promise<BatchUpdateTxResponse> {
+  return authedPost<BatchUpdateTxResponse>(
+    `/write/ledgers/${encodeURIComponent(options.ledgerId)}/transactions/batch/update`,
+    token,
+    {
+      tx_ids: options.txIds,
+      category_id: options.categoryId,
+      category_name: options.categoryName,
+      category_kind: options.categoryKind,
+      base_change_id: options.baseChangeId ?? 0,
+    },
+    options.idempotencyKey
+  )
+}
+
+export type CategoryMigrateFailure = {
+  tx_id: string
+  reason: 'permission_denied' | 'conflict' | 'kind_mismatch'
+  message?: string | null
+}
+
+export type CategoryMigrateResponse = {
+  ledger_id: string
+  base_change_id: number
+  new_change_id: number
+  server_timestamp: string
+  moved_count: number
+  moved_tx_ids: string[]
+  failed: CategoryMigrateFailure[]
+}
+
+/**
+ * POST /write/ledgers/{id}/categories/migrate — 分类迁移。
+ *
+ * 把本账本里引用源分类(categoryId 或 名字+kind,兼容旧数据)的交易全部
+ * 改挂到目标分类。move-only:不删源分类、不碰预算 —— 删源分类由前端迁完
+ * 后走既有 DELETE 端点(此时 tx_count 已为 0,校验天然通过)。跨账本由
+ * 前端按账本逐个调用。
+ */
+export async function migrateCategory(
+  token: string,
+  options: {
+    ledgerId: string
+    sourceCategoryId: string
+    targetCategoryId: string
+    baseChangeId?: number
+    idempotencyKey?: string
+  }
+): Promise<CategoryMigrateResponse> {
+  return authedPost<CategoryMigrateResponse>(
+    `/write/ledgers/${encodeURIComponent(options.ledgerId)}/categories/migrate`,
+    token,
+    {
+      source_category_id: options.sourceCategoryId,
+      target_category_id: options.targetCategoryId,
+      base_change_id: options.baseChangeId ?? 0,
+    },
+    options.idempotencyKey
+  )
+}
+
 export async function createAccount(
   token: string,
   ledgerId: string,
