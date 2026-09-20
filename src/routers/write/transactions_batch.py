@@ -41,7 +41,7 @@ from ...models import (
 )
 from ...security import SCOPE_APP_WRITE, SCOPE_WEB_WRITE
 from ...services.ai.image_cache import consume_image
-from ...snapshot_mutator import create_tag, create_transaction
+from ...snapshot_mutator import create_tag, create_transaction, ensure_snapshot_v2
 from ._shared import (
     _TRANSACTION_WRITE_ROLES,
     _WRITE_RESPONSES,
@@ -195,6 +195,9 @@ async def create_tx_batch(
                 )
 
         snapshot = snapshot_builder.build(db, ledger)
+        # 归一成 UTC 再拷 prev,避免 happenedAt 时区格式差异导致全账本误 emit
+        # (同 _commit_write)。补上此前缺失的一行。
+        snapshot = ensure_snapshot_v2(snapshot)
         prev_snapshot = {**snapshot}
         for _k in ("items", "accounts", "categories", "tags", "budgets"):
             arr = snapshot.get(_k)

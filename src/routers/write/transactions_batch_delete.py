@@ -28,7 +28,7 @@ from ...deps import get_current_user
 from sqlalchemy import select
 
 from ...models import AuditLog, SyncPushIdempotency, User
-from ...snapshot_mutator import delete_transaction
+from ...snapshot_mutator import delete_transaction, ensure_snapshot_v2
 from ._shared import (
     _TRANSACTION_WRITE_ROLES,
     _WRITE_RESPONSES,
@@ -123,6 +123,9 @@ async def delete_tx_batch(
 
     lock_ledger_for_materialize(db, ledger.id)
     snapshot = snapshot_builder.build(db, ledger)
+    # 归一成 UTC 再拷 prev,避免 happenedAt 时区格式差异导致全账本误 emit
+    # (同 _commit_write)。补上此前缺失的一行。
+    snapshot = ensure_snapshot_v2(snapshot)
     # 深拷贝快照用于 diff(跟 batch_create 同模式)
     prev_snapshot = {**snapshot}
     for _k in ("items", "accounts", "categories", "tags", "budgets"):
